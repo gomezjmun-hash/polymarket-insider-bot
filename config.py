@@ -67,6 +67,29 @@ DEFI_CONTRACTS = {
     "sushiswap_router":   "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506",
 }
 
+# ── Hyperliquid ───────────────────────────────────────────────────────────────
+# Assets fijos monitorizados por categoría.
+# Los altcoins con > $1M de volumen 24h se añaden automáticamente como CRYPTO.
+HL_CRYPTO_ASSETS: list[str] = [
+    "BTC", "ETH", "SOL", "BNB", "AVAX", "LINK", "ARB", "OP",
+    "MATIC", "DOGE", "ADA", "DOT", "ATOM", "UNI", "AAVE",
+    "SUI", "APT", "INJ", "TIA", "SEI",
+]
+HL_BOLSA_ASSETS: list[str] = [
+    # Índices
+    "SPX", "NDX", "DJI",
+    # Acciones individuales (si Hyperliquid las lista)
+    "TSLA", "AAPL", "NVDA", "AMZN", "MSFT", "GOOGL", "META",
+]
+HL_COMMODITY_ASSETS: list[str] = [
+    "WTI", "BRENT", "XAU", "XAG", "NG",
+]
+
+# Umbrales de nocional mínimo para generar alerta (USD)
+HL_MIN_USD_CRYPTO: int    = 500_000   # crypto y bolsa
+HL_MIN_USD_BOLSA: int     = 500_000
+HL_MIN_USD_COMMODITY: int = 100_000   # commodities / geopolítica
+
 # Exchanges CEX conocidos (simplificado; se amplía en polygon_rpc.py)
 CEX_LABELS = {
     "0xb5d85cbf7cb3ee0d56b3bb207d5fc4b82f43f511": "Coinbase",

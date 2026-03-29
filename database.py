@@ -23,10 +23,12 @@ async def init_db() -> None:
                 score       INTEGER NOT NULL,
                 breakdown   TEXT    NOT NULL,   -- JSON
                 amount_usd  REAL    NOT NULL,
-                direction   TEXT    NOT NULL,   -- YES / NO
+                direction   TEXT    NOT NULL,   -- LONG / SHORT / YES / NO
                 level       TEXT    NOT NULL,   -- HIGH / MEDIUM
                 event_state TEXT    DEFAULT 'pending',
-                notified    INTEGER DEFAULT 0
+                notified    INTEGER DEFAULT 0,
+                source      TEXT    DEFAULT 'polymarket',  -- polymarket | hyperliquid
+                category    TEXT    DEFAULT 'GEO'          -- GEO | CRYPTO | BOLSA | COMMODITIES
             );
 
             CREATE TABLE IF NOT EXISTS markets_seen (
@@ -48,7 +50,19 @@ async def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_alerts_wallet    ON alerts(wallet);
             CREATE INDEX IF NOT EXISTS idx_alerts_market    ON alerts(market_id);
             CREATE INDEX IF NOT EXISTS idx_alerts_created   ON alerts(created_at);
+            CREATE INDEX IF NOT EXISTS idx_alerts_source    ON alerts(source);
+            CREATE INDEX IF NOT EXISTS idx_alerts_category  ON alerts(category);
         """)
+        # Migración no destructiva: añade columnas nuevas a DBs existentes
+        for col, definition in [
+            ("source",   "TEXT DEFAULT 'polymarket'"),
+            ("category", "TEXT DEFAULT 'GEO'"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE alerts ADD COLUMN {col} {definition}")
+                await db.commit()
+            except Exception:
+                pass  # La columna ya existe
         await db.commit()
     logger.info("Base de datos inicializada: %s", DB_PATH)
 
@@ -62,17 +76,20 @@ async def insert_alert(
     amount_usd: float,
     direction: str,
     level: str,
+    source: str = "polymarket",
+    category: str = "GEO",
 ) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO alerts
                (created_at, market_id, market_name, wallet, score, breakdown,
-                amount_usd, direction, level)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                amount_usd, direction, level, source, category)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 datetime.utcnow().isoformat(),
                 market_id, market_name, wallet, score,
                 json.dumps(breakdown), amount_usd, direction, level,
+                source, category,
             ),
         )
         await db.commit()

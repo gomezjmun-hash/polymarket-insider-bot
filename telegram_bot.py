@@ -17,6 +17,14 @@ from wallet_scorer import breakdown_text
 logger = logging.getLogger(__name__)
 
 POLYGONSCAN_BASE = "https://polygonscan.com/address/"
+HL_PORTFOLIO_BASE = "https://app.hyperliquid.xyz/portfolio/"
+
+_CATEGORY_EMOJI = {
+    "CRYPTO":      "🪙",
+    "BOLSA":       "📈",
+    "COMMODITIES": "🛢",
+    "GEO":         "🌍",
+}
 
 
 def _level_emoji(level: str) -> str:
@@ -27,21 +35,34 @@ def _format_alert(row: dict) -> str:
     breakdown = json.loads(row.get("breakdown") or "{}")
     bd_text = breakdown_text(breakdown)
     level = row.get("level", "MEDIUM")
-    emoji = _level_emoji(level)
-    poly_link = f"https://polymarket.com/event/{row['market_id']}"
-    scan_link = f"{POLYGONSCAN_BASE}{row['wallet']}"
+    category = row.get("category") or "GEO"
+    source = row.get("source") or "polymarket"
+    level_emoji = _level_emoji(level)
+    cat_emoji = _CATEGORY_EMOJI.get(category, "📊")
     created = row.get("created_at", "")[:19].replace("T", " ")
 
+    if source == "hyperliquid":
+        coin = row["market_id"].replace("HL:", "")
+        market_link = f"https://app.hyperliquid.xyz/trade/{coin}"
+        wallet_link = f"{HL_PORTFOLIO_BASE}{row['wallet']}"
+        market_label = "Asset"
+        platform = "Hyperliquid"
+    else:
+        market_link = f"https://polymarket.com/event/{row['market_id']}"
+        wallet_link = f"{POLYGONSCAN_BASE}{row['wallet']}"
+        market_label = "Mercado"
+        platform = "Polymarket"
+
     return (
-        f"{emoji} *ALERTA {level} SOSPECHA*\n"
-        f"🕐 {created} UTC\n\n"
-        f"📊 *Mercado:* {row['market_name']}\n"
+        f"{level_emoji} *ALERTA {level} · {cat_emoji} {category}*\n"
+        f"🕐 {created} UTC · {platform}\n\n"
+        f"📊 *{market_label}:* {row['market_name']}\n"
         f"👛 *Wallet:* `{row['wallet']}`\n"
         f"🎯 *Dirección:* {row['direction']}\n"
-        f"💰 *Importe:* ${row['amount_usd']:,.0f}\n"
+        f"💰 *Nocional:* ${row['amount_usd']:,.0f}\n"
         f"🔢 *Score:* {row['score']} pts\n\n"
         f"*Desglose de puntos:*\n{bd_text}\n\n"
-        f"🔗 [Mercado]({poly_link}) | [Wallet en Polygonscan]({scan_link})"
+        f"🔗 [{market_label}]({market_link}) | [Wallet]({wallet_link})"
     )
 
 

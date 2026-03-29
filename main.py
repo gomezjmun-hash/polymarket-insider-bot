@@ -68,6 +68,8 @@ async def _main_loop() -> None:
     from polymarket_api import PolymarketClient
     from polygon_rpc import PolygonClient
     from monitor import run_monitoring_cycle
+    from hyperliquid_api import HyperliquidClient
+    from hl_monitor import run_hl_monitoring_cycle
     from telegram_bot import TelegramNotifier
 
     await init_db()
@@ -77,27 +79,40 @@ async def _main_loop() -> None:
 
     poly_client = PolymarketClient()
     polygon_client = PolygonClient()
+    hl_client = HyperliquidClient()
 
     logger.info(
-        "Bot iniciado. Intervalo de polling: %ds. "
+        "Bot iniciado (Polymarket + Hyperliquid). Intervalo: %ds. "
         "Presiona Ctrl+C para detener.",
         POLL_INTERVAL_SECONDS,
     )
 
-    try:
+    async def poly_loop() -> None:
         while True:
             try:
                 await run_monitoring_cycle(poly_client, polygon_client, notifier)
             except Exception as exc:
-                logger.error("Error en ciclo de monitorización: %s", exc, exc_info=True)
-
-            logger.info("Próximo ciclo en %ds...", POLL_INTERVAL_SECONDS)
+                logger.error("Error en ciclo Polymarket: %s", exc, exc_info=True)
+            logger.info("Polymarket — próximo ciclo en %ds...", POLL_INTERVAL_SECONDS)
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+    async def hl_loop() -> None:
+        while True:
+            try:
+                await run_hl_monitoring_cycle(hl_client, notifier)
+            except Exception as exc:
+                logger.error("Error en ciclo Hyperliquid: %s", exc, exc_info=True)
+            logger.info("Hyperliquid — próximo ciclo en %ds...", POLL_INTERVAL_SECONDS)
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+    try:
+        await asyncio.gather(poly_loop(), hl_loop())
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Deteniendo bot...")
     finally:
         await poly_client.close()
         await polygon_client.close()
+        await hl_client.close()
         await notifier.stop()
         logger.info("Bot detenido.")
 
