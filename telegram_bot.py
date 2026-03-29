@@ -186,8 +186,15 @@ class TelegramNotifier:
     # ── Ciclo de vida ─────────────────────────────────────────────────────────
 
     async def start_polling(self) -> None:
-        """Inicia el polling de comandos en background."""
+        """Inicia el polling de comandos en background.
+
+        Llama a deleteWebhook antes de arrancar para que Telegram invalide
+        cualquier sesión getUpdates activa de una instancia anterior, evitando
+        el error Conflict cuando Railway reinicia el proceso.
+        """
         await self._app.initialize()
+        # Elimina webhook y sesión de polling previa antes de arrancar.
+        await self._app.bot.delete_webhook(drop_pending_updates=True)
         await self._app.start()
         await self._app.updater.start_polling(drop_pending_updates=True)
         logger.info("Bot de Telegram iniciado, escuchando comandos...")
