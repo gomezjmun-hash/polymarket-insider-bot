@@ -5,7 +5,9 @@ de request. No requiere autenticación para datos de mercado y trades.
 
 Referencia: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api
 """
+import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -16,10 +18,20 @@ logger = logging.getLogger(__name__)
 HL_API_BASE = "https://api.hyperliquid.xyz"
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20)
 
+# Rate limiting: mínimo de segundos entre peticiones
+_MIN_REQUEST_INTERVAL = 0.5  # 2 req/s como margen seguro
+
+# Backoff exponencial: base, máximo de reintentos y cap de espera
+_BACKOFF_BASE = 2.0
+_BACKOFF_MAX_RETRIES = 5
+_BACKOFF_CAP = 60.0
+
 
 class HyperliquidClient:
     def __init__(self) -> None:
         self._session: Optional[aiohttp.ClientSession] = None
+        self._last_request_time: float = 0.0
+        self._lock = asyncio.Lock()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -30,20 +42,51 @@ class HyperliquidClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    async def _throttle(self) -> None:
+        """Espera lo necesario para respetar el intervalo mínimo entre peticiones."""
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_request_time
+            wait = _MIN_REQUEST_INTERVAL - elapsed
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request_time = time.monotonic()
+
     async def _post(self, payload: dict) -> Any:
         session = await self._get_session()
         url = f"{HL_API_BASE}/info"
-        try:
-            async with session.post(url, json=payload) as resp:
-                if resp.status != 200:
-                    logger.warning(
-                        "HL POST %s -> HTTP %s", payload.get("type"), resp.status
-                    )
-                    return None
-                return await resp.json(content_type=None)
-        except Exception as exc:
-            logger.error("Error HL POST %s: %s", payload.get("type"), exc)
-            return None
+        req_type = payload.get("type")
+
+        for attempt in range(_BACKOFF_MAX_RETRIES + 1):
+            await self._throttle()
+            try:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status == 429:
+                        wait = min(_BACKOFF_BASE ** attempt, _BACKOFF_CAP)
+                        logger.warning(
+                            "HL rate limit (429) en %s, reintento %d/%d en %.1fs",
+                            req_type, attempt + 1, _BACKOFF_MAX_RETRIES, wait,
+                        )
+                        if attempt < _BACKOFF_MAX_RETRIES:
+                            await asyncio.sleep(wait)
+                            continue
+                        logger.error("HL max reintentos alcanzado para %s", req_type)
+                        return None
+                    if resp.status != 200:
+                        logger.warning(
+                            "HL POST %s -> HTTP %s", req_type, resp.status
+                        )
+                        return None
+                    return await resp.json(content_type=None)
+            except Exception as exc:
+                logger.error("Error HL POST %s: %s", req_type, exc)
+                if attempt < _BACKOFF_MAX_RETRIES:
+                    wait = min(_BACKOFF_BASE ** attempt, _BACKOFF_CAP)
+                    await asyncio.sleep(wait)
+                    continue
+                return None
+
+        return None
 
     # ── Metadatos de mercado ───────────────────────────────────────────────────
 
