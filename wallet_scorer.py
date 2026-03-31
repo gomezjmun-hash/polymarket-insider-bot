@@ -8,7 +8,8 @@ from config import (
     SCORE_WALLET_NEW_7D, SCORE_FEW_TRADES, SCORE_FUNDS_FROM_CEX,
     SCORE_NO_DEFI, SCORE_ONE_DIRECTION, SCORE_GROUP_ENTRY_2H,
     SCORE_SHARED_ORIGIN, SCORE_FAST_FIRST_BET, SCORE_LARGE_POSITION,
-    SCORE_CONCENTRATED, SCORE_HIGH, SCORE_MEDIUM,
+    SCORE_CONCENTRATED, SCORE_POSITION_VS_OI, SCORE_COUNTER_TREND,
+    SCORE_HIGH, SCORE_MEDIUM,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,9 @@ class WalletContext:
     shared_origin_wallets: list[str]    # wallets con mismo origen que ésta
     total_portfolio_usd: float          # capital total apostado en Polymarket
     market_position_usd: float          # capital en este mercado
+    # Campos opcionales — usados principalmente para señales de Hyperliquid
+    oi_pct: float = 0.0                 # posición como % del OI total del asset
+    counter_trend: bool = False         # True si la posición va contra tendencia reciente
 
 
 async def score_wallet(ctx: WalletContext) -> ScoreResult:
@@ -141,6 +145,22 @@ async def score_wallet(ctx: WalletContext) -> ScoreResult:
                 SCORE_CONCENTRATED,
                 f"{pct:.0f}% del capital en este mercado (> 70%)",
             )
+
+    # 11. Posición >= 0.05% del OI total del asset (señal Hyperliquid)
+    if ctx.oi_pct >= 0.05:
+        result.add(
+            "position_vs_oi",
+            SCORE_POSITION_VS_OI,
+            f"Posición = {ctx.oi_pct:.3f}% del OI total del asset (≥ 0.05%)",
+        )
+
+    # 12. Posición contraria a la tendencia reciente de precio (señal Hyperliquid)
+    if ctx.counter_trend:
+        result.add(
+            "counter_trend",
+            SCORE_COUNTER_TREND,
+            "Posición contraria a la tendencia reciente del precio",
+        )
 
     result.finalize()
     logger.debug(

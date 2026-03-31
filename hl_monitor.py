@@ -1,17 +1,17 @@
-"""Loop de monitorización de Hyperliquid para insider trading.
+"""Loop de monitorización de Hyperliquid — estrategia basada en spikes de OI.
+
+Flujo de cada ciclo:
+  1. Obtener metaAndAssetCtxs → OI actual + markPx por asset.
+  2. Detectar assets con variación de OI significativa respecto al ciclo anterior.
+  3. Obtener el leaderboard diario para conseguir direcciones de wallets activas.
+  4. Obtener clearinghouseState de cada wallet del leaderboard una sola vez.
+  5. Cruzar posiciones abiertas con los assets que tuvieron spike de OI.
+  6. Puntuar y alertar posiciones que superen el umbral de score.
 
 Categorías:
-  CRYPTO      — BTC, ETH, SOL y cualquier altcoin con volumen > $1M/24h
+  CRYPTO      — BTC, ETH, SOL y altcoins con volumen > $1M/24h
   BOLSA       — Índices (SPX, NDX, DJI) y acciones individuales
   COMMODITIES — Petróleo (WTI, BRENT), oro (XAU), plata (XAG), gas (NG)
-
-El sistema de scoring reutiliza WalletContext + score_wallet del módulo
-principal, adaptando los campos a la semántica de Hyperliquid:
-  - age_days          → días desde el primer fill en HL
-  - poly_trade_count  → total de fills en HL
-  - funding_source    → None (no aplica en HL)
-  - has_defi          → True (no penalizar por ausencia de DeFi)
-  - direction         → LONG / SHORT
 """
 import logging
 from collections import defaultdict
@@ -22,6 +22,7 @@ from config import (
     SCORE_HIGH, SCORE_MEDIUM,
     HL_CRYPTO_ASSETS, HL_BOLSA_ASSETS, HL_COMMODITY_ASSETS,
     HL_MIN_USD_CRYPTO, HL_MIN_USD_BOLSA, HL_MIN_USD_COMMODITY,
+    HL_OI_SPIKE_PCT, HL_OI_SPIKE_MIN_USD, HL_LEADERBOARD_SIZE,
 )
 from database import insert_alert, alert_exists
 from hyperliquid_api import HyperliquidClient
@@ -29,8 +30,11 @@ from wallet_scorer import WalletContext, score_wallet
 
 logger = logging.getLogger(__name__)
 
-# Caché de trades recientes por asset → detectar entradas coordinadas en 2h
-# asset → list[(wallet, timestamp, side)]
+# ── Estado persistente entre ciclos ──────────────────────────────────────────
+_prev_oi_usd: dict[str, float] = {}   # asset → OI en USD del ciclo anterior
+_prev_mids: dict[str, float] = {}     # asset → mid price del ciclo anterior
+
+# Caché de entradas recientes para detección de movimientos coordinados (2h)
 _hl_recent_trades: dict[str, list[tuple[str, datetime, str]]] = defaultdict(list)
 
 
@@ -73,7 +77,7 @@ def _category_for_asset(asset: str) -> str:
         return "BOLSA"
     if a in _COMMODITY_SET:
         return "COMMODITIES"
-    return "CRYPTO"  # default para assets de crypto y altcoins
+    return "CRYPTO"
 
 
 def _min_usd_for_category(category: str) -> float:
@@ -84,38 +88,76 @@ def _min_usd_for_category(category: str) -> float:
     return HL_MIN_USD_CRYPTO
 
 
-# ── Análisis de trade individual ──────────────────────────────────────────────
+# ── Extracción de posición ────────────────────────────────────────────────────
 
-async def analyze_hl_trade(
-    trade: dict,
-    asset: str,
-    category: str,
+def _extract_position(state: dict, coin: str) -> Optional[dict]:
+    """Devuelve el dict de posición para coin o None si no hay posición abierta."""
+    for p in state.get("assetPositions", []):
+        pos = p.get("position", {})
+        if pos.get("coin", "").upper() == coin.upper():
+            try:
+                if float(pos.get("szi", 0) or 0) != 0:
+                    return pos
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+# ── Análisis de una posición concreta ────────────────────────────────────────
+
+async def _analyze_position(
     wallet: str,
+    coin: str,
+    category: str,
+    state: dict,
+    pos: dict,
+    oi_usd: float,
+    oi_change_pct: float,
+    mark_px: float,
+    prev_mid: float,
     hl_client: HyperliquidClient,
 ) -> Optional[int]:
-    """Analiza un trade de Hyperliquid y genera alerta si score >= umbral.
+    """Puntúa una posición abierta en un asset con spike de OI.
 
     Devuelve el alert_id creado o None si no supera el umbral.
     """
-    market_id = f"HL:{asset}"
-    market_name = f"{asset} Perpetual ({category})"
+    market_id = f"HL:{coin}"
+    market_name = f"{coin} Perpetual ({category})"
 
     if await alert_exists(market_id, wallet):
         return None
 
-    notional = float(trade.get("_notional_usd", 0))
-    # "B" = buy (taker compra = LONG agresivo), "A" = sell (taker vende = SHORT)
-    side = trade.get("side", "B")
-    direction = "LONG" if side == "B" else "SHORT"
+    try:
+        szi = float(pos.get("szi", 0) or 0)
+        entry_px = float(pos.get("entryPx", 0) or 0)
+    except (TypeError, ValueError):
+        return None
 
-    # ── Datos on-chain de la cuenta en HL ────────────────────────────────────
+    # Valor nocional: entrada × tamaño; si no hay entry_px, usamos markPx
+    position_value = abs(szi * entry_px) if entry_px > 0 else abs(szi * mark_px)
+    direction = "LONG" if szi > 0 else "SHORT"
+
+    if position_value < _min_usd_for_category(category):
+        return None
+
+    # ── Contra-tendencia ──────────────────────────────────────────────────────
+    counter_trend = False
+    if prev_mid > 0 and mark_px > 0 and prev_mid != mark_px:
+        price_went_up = mark_px > prev_mid
+        counter_trend = (price_went_up and direction == "SHORT") or \
+                        (not price_went_up and direction == "LONG")
+
+    # ── Concentración vs OI total ─────────────────────────────────────────────
+    oi_pct = (position_value / oi_usd * 100) if oi_usd > 0 else 0.0
+
+    # ── Datos históricos de la cuenta ────────────────────────────────────────
     age_days = await hl_client.get_account_age_days(wallet)
     fills = await hl_client.get_user_fills(wallet)
     fill_count = len(fills)
 
     first_trade_date: Optional[datetime] = None
     if fills:
-        times = []
+        times: list[datetime] = []
         for f in fills:
             t = f.get("time")
             if t:
@@ -127,36 +169,43 @@ async def analyze_hl_trade(
                     pass
         first_trade_date = min(times) if times else None
 
-    account_equity = await hl_client.get_account_equity(wallet)
-    position_value = await hl_client.get_position_value(wallet, asset)
+    try:
+        account_equity = float(
+            state.get("marginSummary", {}).get("accountValue", 0) or 0
+        )
+    except (TypeError, ValueError):
+        account_equity = 0.0
 
-    # ── Detección de entradas coordinadas ────────────────────────────────────
-    group_wallets = _find_hl_group_wallets(asset, wallet, direction)
-    _register_hl_trade(asset, wallet, direction)
-
-    # Valor total de la posición en este mercado (histórico + este trade)
-    market_position_usd = max(position_value, notional)
+    # ── Entradas coordinadas ──────────────────────────────────────────────────
+    group_wallets = _find_hl_group_wallets(coin, wallet, direction)
+    _register_hl_trade(coin, wallet, direction)
 
     ctx = WalletContext(
         wallet=wallet,
         age_days=age_days,
-        poly_trade_count=fill_count,      # fills históricos en HL
-        funding_source=None,               # no aplica en HL
-        has_defi=True,                     # no penalizar por ausencia de DeFi
-        first_poly_date=first_trade_date,  # primer fill en HL
-        wallet_created=first_trade_date,   # proxy de creación = primer fill
-        amount_usd=notional,
+        poly_trade_count=fill_count,
+        funding_source=None,
+        has_defi=True,            # no penalizar por ausencia de DeFi en HL
+        first_poly_date=first_trade_date,
+        wallet_created=None,      # no tenemos fecha real de creación on-chain en HL
+        amount_usd=position_value,
         direction=direction,
-        has_hedge=False,                   # simplificado
+        has_hedge=False,
         group_wallets=group_wallets,
-        shared_origin_wallets=[],          # no se comprueba origen on-chain en HL
-        total_portfolio_usd=max(account_equity, notional),
-        market_position_usd=market_position_usd,
+        shared_origin_wallets=[],
+        total_portfolio_usd=max(account_equity, position_value),
+        market_position_usd=position_value,
+        oi_pct=oi_pct,
+        counter_trend=counter_trend,
     )
 
     result = await score_wallet(ctx)
 
     if result.level not in ("HIGH", "MEDIUM"):
+        logger.debug(
+            "HL %s wallet=%s score=%d (%s) — descartado",
+            coin, wallet, result.total, result.level,
+        )
         return None
 
     alert_id = await insert_alert(
@@ -165,15 +214,17 @@ async def analyze_hl_trade(
         wallet=wallet,
         score=result.total,
         breakdown=result.breakdown,
-        amount_usd=notional,
+        amount_usd=position_value,
         direction=direction,
         level=result.level,
         source="hyperliquid",
         category=category,
     )
     logger.info(
-        "ALERTA HL %s [%s] [id=%d] wallet=%s score=%d asset=%s nocional=$%,.0f",
-        result.level, category, alert_id, wallet, result.total, asset, notional,
+        "ALERTA HL %s [%s] [id=%d] wallet=%s score=%d asset=%s "
+        "pos=$%,.0f oi_pct=%.3f%% oi_chg=%.1f%%",
+        result.level, category, alert_id, wallet, result.total,
+        coin, position_value, oi_pct, oi_change_pct,
     )
     return alert_id
 
@@ -187,78 +238,126 @@ async def run_hl_monitoring_cycle(
     """Un ciclo completo de monitorización de Hyperliquid."""
     logger.info("-- HL: Iniciando ciclo de monitorización --")
 
-    # Obtener todos los assets disponibles para descubrir altcoins activos
+    # 1. Datos de mercado actuales
     asset_contexts = await hl_client.get_asset_contexts()
+    all_mids = await hl_client.get_all_mids()
+
     if not asset_contexts:
         logger.warning("HL: No se pudieron obtener asset contexts.")
+        logger.info("-- HL: Ciclo completado --")
         return
 
-    available_coins_upper = {a.get("name", "").upper() for a in asset_contexts}
+    # 2. Detectar spikes de OI comparando con ciclo anterior
+    spiked: list[dict] = []
+    current_oi: dict[str, float] = {}
+    current_mids: dict[str, float] = {}
 
-    # ── Construir lista de assets a monitorizar ───────────────────────────────
-    # asset → category
-    monitored: dict[str, str] = {}
-
-    for coin in HL_CRYPTO_ASSETS:
-        if coin.upper() in available_coins_upper:
-            monitored[coin] = "CRYPTO"
-
-    for coin in HL_BOLSA_ASSETS:
-        if coin.upper() in available_coins_upper:
-            monitored[coin] = "BOLSA"
-
-    for coin in HL_COMMODITY_ASSETS:
-        if coin.upper() in available_coins_upper:
-            monitored[coin] = "COMMODITIES"
-
-    # Altcoins dinámicos: cualquier asset de HL con > $1M de volumen 24h
-    # que no esté ya clasificado explícitamente
-    known_upper = _CRYPTO_SET | _BOLSA_SET | _COMMODITY_SET
     for ctx_entry in asset_contexts:
         coin = ctx_entry.get("name", "")
-        if not coin or coin.upper() in known_upper or coin in monitored:
+        if not coin:
             continue
         try:
-            volume_24h = float(ctx_entry.get("dayNtlVlm", 0) or 0)
-            if volume_24h > 1_000_000:
-                monitored[coin] = "CRYPTO"
+            mark_px = float(ctx_entry.get("markPx", 0) or 0)
+            oi_contracts = float(ctx_entry.get("openInterest", 0) or 0)
+            oi_usd = oi_contracts * mark_px
         except (TypeError, ValueError):
-            pass
+            continue
 
-    logger.info("HL: %d assets monitorizados", len(monitored))
+        current_oi[coin] = oi_usd
 
-    # ── Escanear trades grandes por asset ─────────────────────────────────────
-    for asset, category in monitored.items():
-        min_usd = _min_usd_for_category(category)
-        try:
-            large_trades = await hl_client.get_large_trades(asset, min_usd)
-            if large_trades:
-                logger.debug(
-                    "HL %s [%s]: %d trades >= $%,.0f",
-                    asset, category, len(large_trades), min_usd,
+        # allMids tiene mayor precisión que markPx para el seguimiento de tendencia
+        mid = all_mids.get(coin, mark_px)
+        current_mids[coin] = mid if mid else mark_px
+
+        # Comparar con el ciclo anterior para detectar spike
+        prev_oi = _prev_oi_usd.get(coin, 0.0)
+        if prev_oi > 0 and oi_usd >= HL_OI_SPIKE_MIN_USD:
+            pct = (oi_usd - prev_oi) / prev_oi * 100
+            if abs(pct) >= HL_OI_SPIKE_PCT:
+                spiked.append({
+                    "coin": coin,
+                    "category": _category_for_asset(coin),
+                    "oi_usd": oi_usd,
+                    "oi_change_pct": pct,
+                    "mark_px": mark_px,
+                    "prev_mid": _prev_mids.get(coin, 0.0),
+                })
+
+    # Actualizar estado persistente para el próximo ciclo
+    _prev_oi_usd.update(current_oi)
+    _prev_mids.update(current_mids)
+
+    logger.info(
+        "HL: %d assets monitorizados, %d con spike de OI (≥%.0f%%).",
+        len(current_oi), len(spiked), HL_OI_SPIKE_PCT,
+    )
+
+    if not spiked:
+        logger.info("-- HL: Ciclo completado --")
+        return
+
+    logger.info(
+        "HL: Assets con spike: %s",
+        [(s["coin"], f"{s['oi_change_pct']:+.1f}%") for s in spiked],
+    )
+
+    # 3. Obtener wallets del leaderboard diario
+    leaderboard = await hl_client.get_leaderboard("day")
+    wallet_addresses: list[str] = []
+    for row in leaderboard:
+        addr = (row.get("ethAddress") or row.get("address") or "").lower()
+        if addr and addr != "0x0000000000000000000000000000000000000000":
+            wallet_addresses.append(addr)
+        if len(wallet_addresses) >= HL_LEADERBOARD_SIZE:
+            break
+
+    if not wallet_addresses:
+        logger.warning("HL: Leaderboard vacío — sin wallets que analizar.")
+        logger.info("-- HL: Ciclo completado --")
+        return
+
+    logger.info("HL: %d wallets del leaderboard a revisar.", len(wallet_addresses))
+
+    # 4. Obtener clearinghouseState de cada wallet una sola vez
+    wallet_states: dict[str, dict] = {}
+    for wallet in wallet_addresses:
+        state = await hl_client.get_user_state(wallet)
+        if state and state.get("assetPositions"):
+            wallet_states[wallet] = state
+
+    logger.info("HL: %d wallets con posiciones abiertas.", len(wallet_states))
+
+    # 5. Cruzar posiciones con assets que tuvieron spike de OI
+    for spike in spiked:
+        coin = spike["coin"]
+        category = spike["category"]
+        logger.info(
+            "HL SPIKE [%s/%s]: OI=$%,.0f (%+.1f%% vs ciclo anterior)",
+            coin, category, spike["oi_usd"], spike["oi_change_pct"],
+        )
+
+        for wallet, state in wallet_states.items():
+            pos = _extract_position(state, coin)
+            if pos is None:
+                continue
+            try:
+                await _analyze_position(
+                    wallet=wallet,
+                    coin=coin,
+                    category=category,
+                    state=state,
+                    pos=pos,
+                    oi_usd=spike["oi_usd"],
+                    oi_change_pct=spike["oi_change_pct"],
+                    mark_px=spike["mark_px"],
+                    prev_mid=spike["prev_mid"],
+                    hl_client=hl_client,
                 )
-
-            for trade in large_trades:
-                # 'users' es un array [buyer_addr, seller_addr] cuando está disponible.
-                # Analizamos solo el aggresor (taker = users[0]).
-                users = trade.get("users") or []
-                if not users:
-                    continue
-                wallet = users[0].lower() if isinstance(users[0], str) else ""
-                if not wallet or wallet == "0x0000000000000000000000000000000000000000":
-                    continue
-                try:
-                    await analyze_hl_trade(
-                        trade, asset, category, wallet, hl_client,
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Error analizando trade HL %s wallet %s: %s",
-                        asset, wallet, exc, exc_info=True,
-                    )
-
-        except Exception as exc:
-            logger.error("Error procesando asset HL %s: %s", asset, exc)
+            except Exception as exc:
+                logger.error(
+                    "Error analizando posición HL %s wallet %s: %s",
+                    coin, wallet, exc, exc_info=True,
+                )
 
     await notifier.flush_pending()
     logger.info("-- HL: Ciclo completado --")

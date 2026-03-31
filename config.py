@@ -58,6 +58,8 @@ SCORE_SHARED_ORIGIN = 40
 SCORE_FAST_FIRST_BET = 15     # wallet creada y apuesta < 48h
 SCORE_LARGE_POSITION = 15     # > 5000 USD
 SCORE_CONCENTRATED = 10       # > 70% capital en un mercado
+SCORE_POSITION_VS_OI = 20     # posición >= 0.05% del OI total del asset (HL)
+SCORE_COUNTER_TREND = 15      # posición contraria a la tendencia reciente de precio (HL)
 
 # Heurístico: dirección de contratos DeFi conocidos en Polygon
 DEFI_CONTRACTS = {
@@ -86,9 +88,16 @@ HL_COMMODITY_ASSETS: list[str] = [
 ]
 
 # Umbrales de nocional mínimo para generar alerta (USD)
-HL_MIN_USD_CRYPTO: int    = 500_000   # crypto y bolsa
-HL_MIN_USD_BOLSA: int     = 500_000
-HL_MIN_USD_COMMODITY: int = 100_000   # commodities / geopolítica
+HL_MIN_USD_CRYPTO: int    = 50_000    # crypto y bolsa
+HL_MIN_USD_BOLSA: int     = 50_000
+HL_MIN_USD_COMMODITY: int = 25_000   # commodities / geopolítica
+
+# Detección de spikes de Open Interest entre ciclos
+HL_OI_SPIKE_PCT: float = 5.0          # % mínimo de variación de OI para disparar escaneo
+HL_OI_SPIKE_MIN_USD: float = 500_000  # OI mínimo del asset para considerar el spike
+
+# Wallets del leaderboard diario que se revisan en cada ciclo con spike
+HL_LEADERBOARD_SIZE: int = 50
 
 # Exchanges CEX conocidos (simplificado; se amplía en polygon_rpc.py)
 CEX_LABELS = {

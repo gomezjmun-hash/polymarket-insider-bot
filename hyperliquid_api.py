@@ -222,3 +222,34 @@ class HyperliquidClient:
                 except (TypeError, ValueError):
                     pass
         return 0.0
+
+    # ── Datos de mercado agregados ─────────────────────────────────────────────
+
+    async def get_all_mids(self) -> dict[str, float]:
+        """Precios mid actuales para todos los assets. Devuelve {coin: mid_price}."""
+        data = await self._post({"type": "allMids"})
+        if not data or not isinstance(data, dict):
+            return {}
+        result: dict[str, float] = {}
+        for coin, price in data.items():
+            try:
+                result[coin] = float(price)
+            except (TypeError, ValueError):
+                pass
+        return result
+
+    async def get_leaderboard(self, window: str = "day") -> list[dict]:
+        """Top traders del leaderboard público.
+
+        window: 'day' | 'week' | 'month' | 'allTime'
+        Cada fila puede tener 'ethAddress' o 'address' con la dirección de la wallet.
+        """
+        data = await self._post({"type": "leaderboard", "leaderboardWindow": window})
+        if not data:
+            return []
+        # La API puede devolver un dict con 'leaderboardRows' o directamente una lista
+        if isinstance(data, dict):
+            return data.get("leaderboardRows", [])
+        if isinstance(data, list):
+            return data
+        return []
