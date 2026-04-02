@@ -309,6 +309,27 @@ class HyperliquidWSClient:
                 )
                 await asyncio.sleep(self._WS_RECONNECT_DELAY)
 
+    async def _fetch_available_coins(self) -> set[str]:
+        """Obtiene via REST los coins disponibles en Hyperliquid como perpetuos.
+
+        Se llama antes de abrir el WebSocket para filtrar la lista de suscripción:
+        suscribirse a un coin inexistente provoca que el servidor envíe un frame
+        CLOSE que termina toda la sesión WS.
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{HL_API_BASE}/info",
+                    json={"type": "metaAndAssetCtxs"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    data = await resp.json(content_type=None)
+            if data and isinstance(data, list) and data[0]:
+                return {a.get("name", "") for a in data[0].get("universe", [])}
+        except Exception as exc:
+            logger.warning("HL WS: no se pudo obtener coins disponibles: %s", exc)
+        return set()
+
     async def _ping_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Envía ping JSON cada 30s para mantener la conexión viva.
 
@@ -323,15 +344,30 @@ class HyperliquidWSClient:
                 break  # la conexión ya está caída; _connect_and_listen lo detectará
 
     async def _connect_and_listen(self) -> None:
+        # Filtrar coins antes de conectar: suscribirse a un coin que no existe
+        # en Hyperliquid hace que el servidor envíe un frame CLOSE que cierra
+        # toda la sesión, causando "Cannot write to closing transport".
+        available = await self._fetch_available_coins()
+        if available:
+            coins = [c for c in self._coins if c in available]
+            skipped = [c for c in self._coins if c not in available]
+            if skipped:
+                logger.info("HL WS: %d coins omitidos (no en HL perps): %s", len(skipped), skipped)
+        else:
+            coins = self._coins  # fallback si REST falla
+
+        if not coins:
+            logger.warning("HL WS: ningún coin válido para suscribir.")
+            return
+
         # Sin heartbeat= para evitar que aiohttp envíe frames PING de protocolo
         # que Hyperliquid no responde con PONG, lo que causa desconexiones.
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(HL_WS_URL) as ws:
                 logger.info(
-                    "HL WebSocket conectado. Suscribiendo a %d assets…",
-                    len(self._coins),
+                    "HL WebSocket conectado. Suscribiendo a %d assets…", len(coins),
                 )
-                for coin in self._coins:
+                for coin in coins:
                     await ws.send_json({
                         "method": "subscribe",
                         "subscription": {"type": "trades", "coin": coin},
@@ -364,8 +400,8 @@ class HyperliquidWSClient:
         except Exception:
             return
         channel = msg.get("channel")
-        if channel == "pong":
-            return  # respuesta al ping JSON, ignorar
+        if channel in ("pong", "subscriptionResponse"):
+            return  # mensajes de control, ignorar
         if channel != "trades":
             return
         data = msg.get("data", [])
