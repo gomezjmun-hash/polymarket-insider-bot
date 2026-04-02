@@ -71,7 +71,7 @@ async def _main_loop() -> None:
     from hyperliquid_api import HyperliquidClient, HyperliquidWSClient
     from hl_monitor import run_hl_monitoring_cycle, on_ws_trade
     from telegram_bot import TelegramNotifier
-    from config import HL_CRYPTO_ASSETS, HL_BOLSA_ASSETS, HL_COMMODITY_ASSETS
+    from config import HL_CRYPTO_ASSETS, HL_BOLSA_ASSETS, HL_COMMODITY_ASSETS, HL_OI_SPIKE_MIN_USD
 
     await init_db()
 
@@ -83,13 +83,14 @@ async def _main_loop() -> None:
     hl_client = HyperliquidClient()
 
     # WebSocket de Hyperliquid: acumula wallets activas en tiempo real.
-    # Se suscribe a todos los assets fijos monitorizados.
+    # Hint con las listas fijas; _resolve_coins_to_subscribe añadirá además
+    # todos los altcoins con vol>$1M o OI>HL_OI_SPIKE_MIN_USD (ej. PROMPT).
     ws_client = HyperliquidWSClient()
     ws_client.add_trade_callback(on_ws_trade)
     ws_coins = list(
         set(HL_CRYPTO_ASSETS) | set(HL_BOLSA_ASSETS) | set(HL_COMMODITY_ASSETS)
     )
-    await ws_client.start(ws_coins)
+    await ws_client.start(ws_coins, min_oi_usd=HL_OI_SPIKE_MIN_USD)
 
     logger.info(
         "Bot iniciado (Polymarket + Hyperliquid). Intervalo: %ds. "

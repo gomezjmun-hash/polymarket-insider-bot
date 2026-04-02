@@ -282,6 +282,8 @@ class HyperliquidWSClient:
     def __init__(self) -> None:
         self._callbacks: list[Callable[[dict], None]] = []
         self._coins: list[str] = []
+        self._min_vol_usd: float = 1_000_000
+        self._min_oi_usd: float = 500_000
         self._running = False
         self._task: Optional[asyncio.Task] = None
 
@@ -289,12 +291,25 @@ class HyperliquidWSClient:
         """Registra un callback síncrono que se invoca por cada trade recibido."""
         self._callbacks.append(fn)
 
-    async def start(self, coins: list[str]) -> None:
-        """Inicia la tarea WebSocket en background."""
+    async def start(
+        self,
+        coins: list[str],
+        min_vol_usd: float = 1_000_000,
+        min_oi_usd: float = 500_000,
+    ) -> None:
+        """Inicia la tarea WebSocket en background.
+
+        coins      — lista base (hint); se filtra a los que existen en HL.
+        min_vol_usd — umbral de volumen 24h para incluir altcoins dinámicos.
+        min_oi_usd  — umbral de OI para incluir assets con bajo volumen pero
+                      OI significativo (ej. PROMPT).
+        """
         self._coins = list(coins)
+        self._min_vol_usd = min_vol_usd
+        self._min_oi_usd = min_oi_usd
         self._running = True
         self._task = asyncio.create_task(self._run(), name="hl-ws")
-        logger.info("HL WebSocket: arrancando suscripción a %d assets.", len(coins))
+        logger.info("HL WebSocket: arrancando suscripción (hint: %d assets).", len(coins))
 
     async def _run(self) -> None:
         while self._running:
@@ -309,12 +324,20 @@ class HyperliquidWSClient:
                 )
                 await asyncio.sleep(self._WS_RECONNECT_DELAY)
 
-    async def _fetch_available_coins(self) -> set[str]:
-        """Obtiene via REST los coins disponibles en Hyperliquid como perpetuos.
+    async def _resolve_coins_to_subscribe(
+        self,
+        min_vol_usd: float = 1_000_000,
+        min_oi_usd: float = 500_000,
+    ) -> list[str]:
+        """Construye la lista final de coins a suscribir en el WS.
 
-        Se llama antes de abrir el WebSocket para filtrar la lista de suscripción:
-        suscribirse a un coin inexistente provoca que el servidor envíe un frame
-        CLOSE que termina toda la sesión WS.
+        Une dos fuentes:
+          1. self._coins filtrados a los que realmente existen en HL como perpetuos.
+          2. Todos los assets que cumplen vol_24h >= min_vol_usd
+             OR oi_usd >= min_oi_usd.
+
+        El criterio OR garantiza que assets como PROMPT (alto OI, bajo volumen)
+        estén en el pool cuando el monitor de OI detecte spikes en ellos.
         """
         try:
             async with aiohttp.ClientSession() as session:
@@ -324,11 +347,48 @@ class HyperliquidWSClient:
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     data = await resp.json(content_type=None)
-            if data and isinstance(data, list) and data[0]:
-                return {a.get("name", "") for a in data[0].get("universe", [])}
+            if not data or not isinstance(data, list) or len(data) < 2:
+                return self._coins
+
+            universe = data[0].get("universe", [])
+            ctxs = data[1]
+            available: set[str] = set()
+            dynamic: set[str] = set()
+            for meta, ctx in zip(universe, ctxs):
+                name = meta.get("name", "")
+                if not name:
+                    continue
+                available.add(name)
+                try:
+                    vol = float(ctx.get("dayNtlVlm", 0) or 0)
+                    mark_px = float(ctx.get("markPx", 0) or 0)
+                    oi_usd = float(ctx.get("openInterest", 0) or 0) * mark_px
+                except (TypeError, ValueError):
+                    vol, oi_usd = 0.0, 0.0
+                if vol >= min_vol_usd or oi_usd >= min_oi_usd:
+                    dynamic.add(name)
+
+            wanted_valid = {c for c in self._coins if c in available}
+            combined = wanted_valid | dynamic
+            skipped = {c for c in self._coins if c not in available}
+            if skipped:
+                logger.info(
+                    "HL WS: %d coins omitidos (no en HL perps): %s",
+                    len(skipped), sorted(skipped),
+                )
+            logger.info(
+                "HL WS: %d fijos + %d dinámicos (vol>$%.0fM o OI>$%.0fk) = %d suscritos.",
+                len(wanted_valid),
+                len(dynamic - wanted_valid),
+                min_vol_usd / 1_000_000,
+                min_oi_usd / 1_000,
+                len(combined),
+            )
+            return sorted(combined)
+
         except Exception as exc:
-            logger.warning("HL WS: no se pudo obtener coins disponibles: %s", exc)
-        return set()
+            logger.warning("HL WS: no se pudo resolver coins a suscribir: %s", exc)
+            return self._coins
 
     async def _ping_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Envía ping JSON cada 30s para mantener la conexión viva.
@@ -344,17 +404,13 @@ class HyperliquidWSClient:
                 break  # la conexión ya está caída; _connect_and_listen lo detectará
 
     async def _connect_and_listen(self) -> None:
-        # Filtrar coins antes de conectar: suscribirse a un coin que no existe
-        # en Hyperliquid hace que el servidor envíe un frame CLOSE que cierra
-        # toda la sesión, causando "Cannot write to closing transport".
-        available = await self._fetch_available_coins()
-        if available:
-            coins = [c for c in self._coins if c in available]
-            skipped = [c for c in self._coins if c not in available]
-            if skipped:
-                logger.info("HL WS: %d coins omitidos (no en HL perps): %s", len(skipped), skipped)
-        else:
-            coins = self._coins  # fallback si REST falla
+        # Resolver lista de coins antes de conectar:
+        # - Filtra coins inválidos (causarían un CLOSE frame del servidor)
+        # - Añade altcoins con >$1M de volumen 24h no incluidos en la lista fija
+        coins = await self._resolve_coins_to_subscribe(
+            min_vol_usd=self._min_vol_usd,
+            min_oi_usd=self._min_oi_usd,
+        )
 
         if not coins:
             logger.warning("HL WS: ningún coin válido para suscribir.")
