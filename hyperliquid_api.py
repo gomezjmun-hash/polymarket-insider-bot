@@ -276,6 +276,8 @@ class HyperliquidWSClient:
     """
 
     _WS_RECONNECT_DELAY = 10   # segundos entre reconexiones
+    _PING_INTERVAL = 30        # segundos entre pings JSON
+    _SUBSCRIBE_PAUSE = 0.05    # pausa entre suscripciones para no saturar el servidor
 
     def __init__(self) -> None:
         self._callbacks: list[Callable[[dict], None]] = []
@@ -307,9 +309,24 @@ class HyperliquidWSClient:
                 )
                 await asyncio.sleep(self._WS_RECONNECT_DELAY)
 
+    async def _ping_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Envía ping JSON cada 30s para mantener la conexión viva.
+
+        Hyperliquid usa pings a nivel de aplicación (JSON), no frames PING
+        de protocolo WebSocket. Por eso no se usa heartbeat= en ws_connect.
+        """
+        while True:
+            await asyncio.sleep(self._PING_INTERVAL)
+            try:
+                await ws.send_json({"method": "ping"})
+            except Exception:
+                break  # la conexión ya está caída; _connect_and_listen lo detectará
+
     async def _connect_and_listen(self) -> None:
+        # Sin heartbeat= para evitar que aiohttp envíe frames PING de protocolo
+        # que Hyperliquid no responde con PONG, lo que causa desconexiones.
         async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(HL_WS_URL, heartbeat=30) as ws:
+            async with session.ws_connect(HL_WS_URL) as ws:
                 logger.info(
                     "HL WebSocket conectado. Suscribiendo a %d assets…",
                     len(self._coins),
@@ -319,24 +336,37 @@ class HyperliquidWSClient:
                         "method": "subscribe",
                         "subscription": {"type": "trades", "coin": coin},
                     })
-                async for msg in ws:
-                    if not self._running:
-                        break
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        self._dispatch(msg.data)
-                    elif msg.type in (
-                        aiohttp.WSMsgType.ERROR,
-                        aiohttp.WSMsgType.CLOSED,
-                    ):
-                        logger.warning("HL WebSocket: mensaje de cierre/error.")
-                        break
+                    await asyncio.sleep(self._SUBSCRIBE_PAUSE)
+
+                ping_task = asyncio.create_task(self._ping_loop(ws))
+                try:
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            self._dispatch(msg.data)
+                        elif msg.type in (
+                            aiohttp.WSMsgType.ERROR,
+                            aiohttp.WSMsgType.CLOSED,
+                        ):
+                            logger.warning("HL WebSocket: mensaje de cierre/error.")
+                            break
+                finally:
+                    ping_task.cancel()
+                    try:
+                        await ping_task
+                    except asyncio.CancelledError:
+                        pass
 
     def _dispatch(self, raw: str) -> None:
         try:
             msg = json.loads(raw)
         except Exception:
             return
-        if msg.get("channel") != "trades":
+        channel = msg.get("channel")
+        if channel == "pong":
+            return  # respuesta al ping JSON, ignorar
+        if channel != "trades":
             return
         data = msg.get("data", [])
         trades = data if isinstance(data, list) else [data]
