@@ -3,10 +3,16 @@
 Flujo de cada ciclo:
   1. Obtener metaAndAssetCtxs → OI actual + markPx por asset.
   2. Detectar assets con variación de OI significativa respecto al ciclo anterior.
-  3. Obtener el leaderboard diario para conseguir direcciones de wallets activas.
-  4. Obtener clearinghouseState de cada wallet del leaderboard una sola vez.
-  5. Cruzar posiciones abiertas con los assets que tuvieron spike de OI.
-  6. Puntuar y alertar posiciones que superen el umbral de score.
+  3. Para cada asset con spike, buscar en el wallet pool las wallets activas
+     que fueron vistas en trades recientes (acumuladas vía WebSocket).
+  4. Consultar clearinghouseState de esas wallets para encontrar posiciones abiertas.
+  5. Puntuar y alertar posiciones que superen el umbral de score.
+
+Descubrimiento de wallets:
+  El endpoint REST de Hyperliquid no ofrece listados de traders. El WS sí incluye
+  el campo 'users: [buyer, seller]' en cada evento de trade. La función
+  on_ws_trade() actúa como callback del HyperliquidWSClient y va llenando
+  _wallet_pool, un dict por asset con las wallets vistas en las últimas N horas.
 
 Categorías:
   CRYPTO      — BTC, ETH, SOL y altcoins con volumen > $1M/24h
@@ -22,7 +28,7 @@ from config import (
     SCORE_HIGH, SCORE_MEDIUM,
     HL_CRYPTO_ASSETS, HL_BOLSA_ASSETS, HL_COMMODITY_ASSETS,
     HL_MIN_USD_CRYPTO, HL_MIN_USD_BOLSA, HL_MIN_USD_COMMODITY,
-    HL_OI_SPIKE_PCT, HL_OI_SPIKE_MIN_USD, HL_LEADERBOARD_SIZE,
+    HL_OI_SPIKE_PCT, HL_OI_SPIKE_MIN_USD,
 )
 from database import insert_alert, alert_exists
 from hyperliquid_api import HyperliquidClient
@@ -30,36 +36,71 @@ from wallet_scorer import WalletContext, score_wallet
 
 logger = logging.getLogger(__name__)
 
+# ── Wallet pool: alimentado en tiempo real por el WebSocket ───────────────────
+# asset → {wallet_addr → último timestamp en que fue vista en un trade}
+_wallet_pool: dict[str, dict[str, datetime]] = defaultdict(dict)
+_WALLET_POOL_TTL_HOURS = 4
+
+_NULL_ADDR = "0x" + "0" * 40
+
+
+def on_ws_trade(trade: dict) -> None:
+    """Callback síncrono para HyperliquidWSClient.
+
+    Extrae el campo 'users' de cada trade recibido por WebSocket y almacena
+    las direcciones en _wallet_pool con TTL de 4 horas.
+    """
+    coin = trade.get("coin", "")
+    users = trade.get("users") or []
+    if not coin or not users:
+        return
+    now = datetime.now(tz=timezone.utc)
+    for addr in users:
+        if isinstance(addr, str) and addr and addr.lower() != _NULL_ADDR:
+            _wallet_pool[coin][addr.lower()] = now
+
+
+def _prune_wallet_pool(asset: str) -> None:
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=_WALLET_POOL_TTL_HOURS)
+    _wallet_pool[asset] = {
+        w: ts for w, ts in _wallet_pool[asset].items() if ts > cutoff
+    }
+
+
+def wallet_pool_stats() -> dict[str, int]:
+    """Devuelve el número de wallets activas por asset (para diagnóstico)."""
+    return {asset: len(wallets) for asset, wallets in _wallet_pool.items() if wallets}
+
+
 # ── Estado persistente entre ciclos ──────────────────────────────────────────
-_prev_oi_usd: dict[str, float] = {}   # asset → OI en USD del ciclo anterior
-_prev_mids: dict[str, float] = {}     # asset → mid price del ciclo anterior
+_prev_oi_usd: dict[str, float] = {}
+_prev_mids: dict[str, float] = {}
 
 # Caché de entradas recientes para detección de movimientos coordinados (2h)
-_hl_recent_trades: dict[str, list[tuple[str, datetime, str]]] = defaultdict(list)
+_hl_recent_entries: dict[str, list[tuple[str, datetime, str]]] = defaultdict(list)
 
 
-# ── Helpers de caché ──────────────────────────────────────────────────────────
+# ── Helpers de entradas coordinadas ──────────────────────────────────────────
 
-def _purge_old_hl_trades(asset: str, window_hours: int = 2) -> None:
+def _purge_old_entries(asset: str, window_hours: int = 2) -> None:
     cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=window_hours)
-    _hl_recent_trades[asset] = [
+    _hl_recent_entries[asset] = [
         (w, ts, side)
-        for w, ts, side in _hl_recent_trades[asset]
+        for w, ts, side in _hl_recent_entries[asset]
         if ts > cutoff
     ]
 
 
-def _find_hl_group_wallets(asset: str, wallet: str, side: str) -> list[str]:
-    """Wallets que entraron en el mismo asset/lado en la ventana de 2h."""
-    _purge_old_hl_trades(asset)
+def _find_group_wallets(asset: str, wallet: str, side: str) -> list[str]:
+    _purge_old_entries(asset)
     return [
-        w for w, ts, s in _hl_recent_trades[asset]
+        w for w, ts, s in _hl_recent_entries[asset]
         if w != wallet and s == side
     ]
 
 
-def _register_hl_trade(asset: str, wallet: str, side: str) -> None:
-    _hl_recent_trades[asset].append(
+def _register_entry(asset: str, wallet: str, side: str) -> None:
+    _hl_recent_entries[asset].append(
         (wallet, datetime.now(tz=timezone.utc), side)
     )
 
@@ -133,7 +174,6 @@ async def _analyze_position(
     except (TypeError, ValueError):
         return None
 
-    # Valor nocional: entrada × tamaño; si no hay entry_px, usamos markPx
     position_value = abs(szi * entry_px) if entry_px > 0 else abs(szi * mark_px)
     direction = "LONG" if szi > 0 else "SHORT"
 
@@ -176,18 +216,18 @@ async def _analyze_position(
     except (TypeError, ValueError):
         account_equity = 0.0
 
-    # ── Entradas coordinadas ──────────────────────────────────────────────────
-    group_wallets = _find_hl_group_wallets(coin, wallet, direction)
-    _register_hl_trade(coin, wallet, direction)
+    # ── Entradas coordinadas (entre wallets del pool) ─────────────────────────
+    group_wallets = _find_group_wallets(coin, wallet, direction)
+    _register_entry(coin, wallet, direction)
 
     ctx = WalletContext(
         wallet=wallet,
         age_days=age_days,
         poly_trade_count=fill_count,
         funding_source=None,
-        has_defi=True,            # no penalizar por ausencia de DeFi en HL
+        has_defi=True,
         first_poly_date=first_trade_date,
-        wallet_created=None,      # no tenemos fecha real de creación on-chain en HL
+        wallet_created=None,      # no disponible via API pública de HL
         amount_usd=position_value,
         direction=direction,
         has_hedge=False,
@@ -222,7 +262,7 @@ async def _analyze_position(
     )
     logger.info(
         "ALERTA HL %s [%s] [id=%d] wallet=%s score=%d asset=%s "
-        "pos=$%,.0f oi_pct=%.3f%% oi_chg=%.1f%%",
+        "pos=$%,.0f oi_pct=%.3f%% oi_chg=%+.1f%%",
         result.level, category, alert_id, wallet, result.total,
         coin, position_value, oi_pct, oi_change_pct,
     )
@@ -247,7 +287,7 @@ async def run_hl_monitoring_cycle(
         logger.info("-- HL: Ciclo completado --")
         return
 
-    # 2. Detectar spikes de OI comparando con ciclo anterior
+    # 2. Detectar spikes de OI
     spiked: list[dict] = []
     current_oi: dict[str, float] = {}
     current_mids: dict[str, float] = {}
@@ -264,12 +304,9 @@ async def run_hl_monitoring_cycle(
             continue
 
         current_oi[coin] = oi_usd
-
-        # allMids tiene mayor precisión que markPx para el seguimiento de tendencia
         mid = all_mids.get(coin, mark_px)
         current_mids[coin] = mid if mid else mark_px
 
-        # Comparar con el ciclo anterior para detectar spike
         prev_oi = _prev_oi_usd.get(coin, 0.0)
         if prev_oi > 0 and oi_usd >= HL_OI_SPIKE_MIN_USD:
             pct = (oi_usd - prev_oi) / prev_oi * 100
@@ -283,13 +320,19 @@ async def run_hl_monitoring_cycle(
                     "prev_mid": _prev_mids.get(coin, 0.0),
                 })
 
-    # Actualizar estado persistente para el próximo ciclo
     _prev_oi_usd.update(current_oi)
     _prev_mids.update(current_mids)
 
+    # Log estado del wallet pool para diagnóstico
+    pool_stats = wallet_pool_stats()
     logger.info(
-        "HL: %d assets monitorizados, %d con spike de OI (≥%.0f%%).",
-        len(current_oi), len(spiked), HL_OI_SPIKE_PCT,
+        "HL: %d assets con OI, %d con spike (≥%.0f%%). "
+        "Wallet pool: %d assets, %d wallets totales.",
+        len(current_oi),
+        len(spiked),
+        HL_OI_SPIKE_PCT,
+        len(pool_stats),
+        sum(pool_stats.values()),
     )
 
     if not spiked:
@@ -301,42 +344,32 @@ async def run_hl_monitoring_cycle(
         [(s["coin"], f"{s['oi_change_pct']:+.1f}%") for s in spiked],
     )
 
-    # 3. Obtener wallets del leaderboard diario
-    leaderboard = await hl_client.get_leaderboard("day")
-    wallet_addresses: list[str] = []
-    for row in leaderboard:
-        addr = (row.get("ethAddress") or row.get("address") or "").lower()
-        if addr and addr != "0x0000000000000000000000000000000000000000":
-            wallet_addresses.append(addr)
-        if len(wallet_addresses) >= HL_LEADERBOARD_SIZE:
-            break
-
-    if not wallet_addresses:
-        logger.warning("HL: Leaderboard vacío — sin wallets que analizar.")
-        logger.info("-- HL: Ciclo completado --")
-        return
-
-    logger.info("HL: %d wallets del leaderboard a revisar.", len(wallet_addresses))
-
-    # 4. Obtener clearinghouseState de cada wallet una sola vez
-    wallet_states: dict[str, dict] = {}
-    for wallet in wallet_addresses:
-        state = await hl_client.get_user_state(wallet)
-        if state and state.get("assetPositions"):
-            wallet_states[wallet] = state
-
-    logger.info("HL: %d wallets con posiciones abiertas.", len(wallet_states))
-
-    # 5. Cruzar posiciones con assets que tuvieron spike de OI
+    # 3. Para cada asset con spike, analizar wallets del pool
     for spike in spiked:
         coin = spike["coin"]
         category = spike["category"]
+
+        _prune_wallet_pool(coin)
+        wallets = list(_wallet_pool[coin].keys())
+
         logger.info(
-            "HL SPIKE [%s/%s]: OI=$%,.0f (%+.1f%% vs ciclo anterior)",
-            coin, category, spike["oi_usd"], spike["oi_change_pct"],
+            "HL SPIKE [%s/%s]: OI=$%,.0f (%+.1f%%) — %d wallets en pool.",
+            coin, category, spike["oi_usd"], spike["oi_change_pct"], len(wallets),
         )
 
-        for wallet, state in wallet_states.items():
+        if not wallets:
+            logger.warning(
+                "HL: Pool vacío para %s — el WebSocket aún está acumulando wallets. "
+                "Las alertas empezarán tras unos minutos de actividad.",
+                coin,
+            )
+            continue
+
+        # Obtener estado de cada wallet y cruzar con posición en este asset
+        for wallet in wallets:
+            state = await hl_client.get_user_state(wallet)
+            if not state:
+                continue
             pos = _extract_position(state, coin)
             if pos is None:
                 continue

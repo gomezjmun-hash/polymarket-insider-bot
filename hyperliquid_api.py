@@ -6,16 +6,18 @@ de request. No requiere autenticación para datos de mercado y trades.
 Referencia: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api
 """
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
 
 HL_API_BASE = "https://api.hyperliquid.xyz"
+HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20)
 
 # Rate limiting: mínimo de segundos entre peticiones
@@ -253,3 +255,105 @@ class HyperliquidClient:
         if isinstance(data, list):
             return data
         return []
+
+
+# ── Cliente WebSocket ─────────────────────────────────────────────────────────
+
+class HyperliquidWSClient:
+    """Suscriptor WebSocket a trades de Hyperliquid en tiempo real.
+
+    Los mensajes de trades vía WS incluyen el campo 'users' con las
+    direcciones [buyer, seller], lo que nos permite construir un pool
+    de wallets activas sin necesitar endpoints de descubrimiento (que
+    no existen en la API pública REST de Hyperliquid).
+
+    Uso:
+        ws = HyperliquidWSClient()
+        ws.add_trade_callback(my_fn)   # fn(trade_dict) síncrono
+        await ws.start(["BTC", "ETH"])
+        ...
+        await ws.stop()
+    """
+
+    _WS_RECONNECT_DELAY = 10   # segundos entre reconexiones
+
+    def __init__(self) -> None:
+        self._callbacks: list[Callable[[dict], None]] = []
+        self._coins: list[str] = []
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+
+    def add_trade_callback(self, fn: Callable[[dict], None]) -> None:
+        """Registra un callback síncrono que se invoca por cada trade recibido."""
+        self._callbacks.append(fn)
+
+    async def start(self, coins: list[str]) -> None:
+        """Inicia la tarea WebSocket en background."""
+        self._coins = list(coins)
+        self._running = True
+        self._task = asyncio.create_task(self._run(), name="hl-ws")
+        logger.info("HL WebSocket: arrancando suscripción a %d assets.", len(coins))
+
+    async def _run(self) -> None:
+        while self._running:
+            try:
+                await self._connect_and_listen()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning(
+                    "HL WebSocket desconectado: %s — reconectando en %ds",
+                    exc, self._WS_RECONNECT_DELAY,
+                )
+                await asyncio.sleep(self._WS_RECONNECT_DELAY)
+
+    async def _connect_and_listen(self) -> None:
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(HL_WS_URL, heartbeat=30) as ws:
+                logger.info(
+                    "HL WebSocket conectado. Suscribiendo a %d assets…",
+                    len(self._coins),
+                )
+                for coin in self._coins:
+                    await ws.send_json({
+                        "method": "subscribe",
+                        "subscription": {"type": "trades", "coin": coin},
+                    })
+                async for msg in ws:
+                    if not self._running:
+                        break
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        self._dispatch(msg.data)
+                    elif msg.type in (
+                        aiohttp.WSMsgType.ERROR,
+                        aiohttp.WSMsgType.CLOSED,
+                    ):
+                        logger.warning("HL WebSocket: mensaje de cierre/error.")
+                        break
+
+    def _dispatch(self, raw: str) -> None:
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            return
+        if msg.get("channel") != "trades":
+            return
+        data = msg.get("data", [])
+        trades = data if isinstance(data, list) else [data]
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            for cb in self._callbacks:
+                try:
+                    cb(trade)
+                except Exception as exc:
+                    logger.debug("Error en callback WS trade: %s", exc)
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass

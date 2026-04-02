@@ -68,9 +68,10 @@ async def _main_loop() -> None:
     from polymarket_api import PolymarketClient
     from polygon_rpc import PolygonClient
     from monitor import run_monitoring_cycle
-    from hyperliquid_api import HyperliquidClient
-    from hl_monitor import run_hl_monitoring_cycle
+    from hyperliquid_api import HyperliquidClient, HyperliquidWSClient
+    from hl_monitor import run_hl_monitoring_cycle, on_ws_trade
     from telegram_bot import TelegramNotifier
+    from config import HL_CRYPTO_ASSETS, HL_BOLSA_ASSETS, HL_COMMODITY_ASSETS
 
     await init_db()
 
@@ -80,6 +81,15 @@ async def _main_loop() -> None:
     poly_client = PolymarketClient()
     polygon_client = PolygonClient()
     hl_client = HyperliquidClient()
+
+    # WebSocket de Hyperliquid: acumula wallets activas en tiempo real.
+    # Se suscribe a todos los assets fijos monitorizados.
+    ws_client = HyperliquidWSClient()
+    ws_client.add_trade_callback(on_ws_trade)
+    ws_coins = list(
+        set(HL_CRYPTO_ASSETS) | set(HL_BOLSA_ASSETS) | set(HL_COMMODITY_ASSETS)
+    )
+    await ws_client.start(ws_coins)
 
     logger.info(
         "Bot iniciado (Polymarket + Hyperliquid). Intervalo: %ds. "
@@ -110,6 +120,7 @@ async def _main_loop() -> None:
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Deteniendo bot...")
     finally:
+        await ws_client.stop()
         await poly_client.close()
         await polygon_client.close()
         await hl_client.close()
