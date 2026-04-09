@@ -157,6 +157,7 @@ async def _analyze_position(
     mark_px: float,
     prev_mid: float,
     hl_client: HyperliquidClient,
+    notifier,
 ) -> Optional[int]:
     """Puntúa una posición abierta en un asset con spike de OI.
 
@@ -258,6 +259,17 @@ async def _analyze_position(
         direction=direction,
         level=result.level,
         source="hyperliquid",
+        category=category,
+    )
+    notifier.buffer_hl_alert(
+        coin=coin,
+        alert_id=alert_id,
+        wallet=wallet,
+        amount_usd=position_value,
+        direction=direction,
+        score=result.total,
+        level=result.level,
+        age_days=age_days,
         category=category,
     )
     logger.info(
@@ -385,6 +397,7 @@ async def run_hl_monitoring_cycle(
                     mark_px=spike["mark_px"],
                     prev_mid=spike["prev_mid"],
                     hl_client=hl_client,
+                    notifier=notifier,
                 )
             except Exception as exc:
                 logger.error(
