@@ -38,6 +38,7 @@ class _HLEntry:
     level: str       # HIGH / MEDIUM
     age_days: float
     category: str
+    oi_pct: float = 0.0
     added_at: datetime = dc_field(
         default_factory=lambda: datetime.now(tz=timezone.utc)
     )
@@ -122,7 +123,7 @@ def _format_hl_grouped(coin: str, entries: list[_HLEntry]) -> str:
         short_w = e.wallet[:6] + "…" + e.wallet[-4:]
         lines.append(
             f"• [{short_w}]({HL_PORTFOLIO_BASE}{e.wallet}) · "
-            f"${e.amount_usd:,.0f} · {e.direction} · Score {e.score}"
+            f"${e.amount_usd:,.0f} · {e.direction} · Score {e.score} · {e.oi_pct:.2f}% del OI"
         )
     lines += ["", f"🔗 [Ver {coin} en Hyperliquid]({hl_link})"]
     return "\n".join(lines)
@@ -330,6 +331,7 @@ class TelegramNotifier:
         level: str,
         age_days: float,
         category: str,
+        oi_pct: float = 0.0,
     ) -> None:
         """Añade una alerta HL al buffer agrupado por asset."""
         entry = _HLEntry(
@@ -341,6 +343,7 @@ class TelegramNotifier:
             level=level,
             age_days=age_days,
             category=category,
+            oi_pct=oi_pct,
         )
         self._hl_buffer.add(coin, entry)
         logger.debug(

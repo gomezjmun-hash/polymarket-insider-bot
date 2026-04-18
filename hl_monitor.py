@@ -271,6 +271,7 @@ async def _analyze_position(
         level=result.level,
         age_days=age_days,
         category=category,
+        oi_pct=oi_pct,
     )
     logger.info(
         "ALERTA HL %s [%s] [id=%d] wallet=%s score=%d asset=%s "
